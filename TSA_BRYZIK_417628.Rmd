@@ -1,0 +1,629 @@
+---
+title: "Value-At-Risk Estimation"
+author: "Michał Bryzik"
+date: "2024-09-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+The objective of this report is to estimate the Value-at-Risk (VaR) of an equally weighted portfolio consisting of five financial instruments using two GARCH-family models. The portfolio includes:
+
+-   Equity index: NASDAQ
+-   Company stock: Tesla
+-   Currency pair: JPY/USD
+-   Commodity: Copper
+-   Cryptocurrency: Ethereum
+
+I will conduct a comparative analysis of:
+
+Annualized conditional standard deviation estimates in the in-sample period produced by the two models. Value-at-Risk estimates in out-of-sample period using a rolling window approach.
+
+## Data Preparation
+
+### Loading dependencies
+
+```{r dependencies}
+rm(list=ls())
+
+library(quantmod)
+library(zoo)
+library(ggplot2)
+library(tseries)
+library(rugarch)
+library(PerformanceAnalytics)
+library(knitr)
+library(MASS)
+library(gridExtra)
+library(dplyr)
+library(kableExtra)
+library(aTSA)
+library(FinTS)
+
+set.seed(417628)
+```
+
+### Downloading and processing data
+
+```{r Downloading data, warning=FALSE}
+# Define symbols and names of time series
+symbols <- c("TSLA", "^IXIC", "JPY=X", "HG=F", "ETH-USD")
+symbolnames <- c("TSLA", "IXIC", "JPY=X", "HG=F", "ETH-USD")
+Symbolnm <- c("Tesla","NASDAQ","JPY/USD","Copper","Ethereum")
+
+# Define date range
+start_date <- as.Date("2019-01-01")
+end_date <- as.Date("2023-12-31")
+
+# Download data
+getSymbols(symbols, src = "yahoo", from = start_date, to = end_date)
+
+# Merge adjusted closing prices
+portfolio_data <- do.call(merge, lapply(symbolnames, function(x) Ad(get(x))))
+colnames(portfolio_data) <- Symbolnm
+
+# Handle missing values
+portfolio_data <- na.locf(na.locf(portfolio_data, fromLast = TRUE), fromLast = FALSE)
+
+# Calculate log returns
+returns <- na.omit(Return.calculate(portfolio_data, method = "log"))
+
+# Compute equally-weighted portfolio returns
+portfolio_returns <- rowMeans(returns)
+returns_combined <- cbind(returns, Portfolio = portfolio_returns)
+```
+Firstly, I download the data, and deal with missing values (NAs), as the chosen portfolio consists of assets with varying trading days. Returns were unified, in case of missing observation, return from previous or next day were incorporated.
+
+
+## Exploratory Data Analysis
+
+As for the begginng, portfolio returns & volatility proxy (squared log returns) had been plotted:
+
+### Preliminary Visualization
+
+```{r, echo = FALSE}
+par(mfrow = c(1, 1))
+chart.TimeSeries(returns_combined$Portfolio, main = "Portfolio Log Returns", ylab = "Log Returns")
+```
+
+```{r, echo = FALSE}
+volatility_data <- returns_combined^2
+
+# Convert to data frame for plotting
+volatility_df <- fortify.zoo(volatility_data, melt = TRUE)
+colnames(volatility_df) <- c("Date", "Asset", "Volatility")
+
+# Plot volatility for all assets
+ggplot(volatility_df, aes(x = Date, y = Volatility, color = Asset)) +
+  geom_line(size = 0.5, alpha = 0.75) +
+  labs(title = "Volatility (Squared Log Returns) of Portfolio and Components",
+       x = "Date",
+       y = "Volatility (Squared Log Returns)") +
+  theme_minimal()
+```
+As can be seen, chosen time series, exhibits strong volatility clustering and heteroscedascity with high volatility spikes during uncertainty in the market. 
+
+```{r, echo = FALSE}
+returns_df <- as.data.frame(returns_combined)
+
+summary_stats <- data.frame(
+  Mean = round(colMeans(returns_df), 5),
+  Median = round(apply(returns_df, 2, median), 5),
+  SD = round(apply(returns_df, 2, sd), 5),
+  Skewness = round(apply(returns_df, 2, skewness), 5),
+  Kurtosis = round(apply(returns_df, 2, kurtosis), 5)
+)
+summary_stats_t <- t(summary_stats)
+
+# Render the table
+kable(summary_stats_t, caption = "Summary Statistics of Log Returns")
+```
+After examination of basic summary statistics, most of the returns distributions of given assets (as well as equally weighted portfolio) are leptokurtic, and slightly negatively skewed, which were expected from financial time series. 
+Based on the preliminary analysis, I've decided to compare given distribution with both normal and t-student's distribution.
+
+
+### Distribution Analysis
+
+#### Density & QQ plots
+```{r Histogram, echo = FALSE}
+portfolio_returns_df <- data.frame(Returns = portfolio_returns)
+mu <- mean(portfolio_returns_df$Returns)
+sigma <- sd(portfolio_returns_df$Returns)
+fit_t <- fitdistr(portfolio_returns_df$Returns, "t")
+df_t <- fit_t$estimate["df"]
+
+# Generate density curves
+x_values <- seq(min(portfolio_returns_df$Returns), max(portfolio_returns_df$Returns), length.out = 100)
+normal_density <- dnorm(x_values, mean = mu, sd = sigma)
+t_density <- dt((x_values - mu) / sigma, df = df_t) / sigma
+density_df <- data.frame(x_values = x_values, normal_density = normal_density, t_density = t_density)
+
+# Plot histogram with density curves
+distr <- ggplot(portfolio_returns_df, aes(x = Returns)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "lightblue", color = "black", alpha = 0.7) +
+  geom_line(data = density_df, aes(x = x_values, y = normal_density, color = "Normal Distribution"), size = 1.2) +
+  geom_line(data = density_df, aes(x = x_values, y = t_density, color = "T-Distribution"), size = 1.2, linetype = "dashed") +
+  labs(title = "Histogram of Portfolio Log Returns with Normal and T-Distribution",
+       x = "Log Returns",
+       y = "Density") +
+  theme_minimal()
+
+qq_normal <- ggplot(portfolio_returns_df, aes(sample = Returns)) +
+  stat_qq(distribution = qnorm, dparams = list(mean = mu, sd = sigma), size = 1.2, alpha = 0.7) +
+  stat_qq_line(distribution = qnorm, dparams = list(mean = mu, sd = sigma), color = "lightcoral", size = 1) +
+  labs(title = "QQ Plot: Portfolio Returns vs. Normal Distribution",
+       x = "Theoretical Quantiles (Normal)",
+       y = "Sample Quantiles") +
+  theme_minimal()
+
+qq_t<- ggplot(portfolio_returns_df, aes(sample = Returns)) +
+  stat_qq(distribution = qt, dparams = list(df = df_t), size = 1.2, alpha = 0.7) +
+  stat_qq_line(distribution = qt, dparams = list(df = df_t), color = "lightblue", size = 1) +
+  labs(title = "QQ Plot: Portfolio Returns vs. T-Distribution",
+       x = "Theoretical Quantiles (T-Distribution)",
+       y = "Sample Quantiles") +
+  theme_minimal()
+
+layout_matrix <- rbind(c(1),
+                       c(2, 3))
+grid.arrange(distr, qq_normal, qq_t, layout_matrix = layout_matrix)
+```
+Based on the given graph, it can be seen that returns distribution from the sample will more likely be effectively modelled with usage of T-distribution than normal distribution. That's why in further analysis, I've decided to perform tests & comparisons on t-version of GARCH models.
+
+### Autocorrelation Analysis
+
+```{r ACF & PACF, echo = FALSE}
+par(mfrow = c(2, 2))
+acf(portfolio_returns_df^2, main = "ACF of Squared Log Returns")
+pacf(portfolio_returns_df^2, main = "PACF of Squared Log Returns")
+acf(portfolio_returns_df, main = "ACF of Log Returns")
+pacf(portfolio_returns_df, main = "PACF of Log Returns")
+par(mfrow = c(1, 1))
+```
+Looking at ACF & PACF plots it can be seen that it's hard to accurately address the autocorrelation factor based on the plots. One of the reasons is a various nature of underlying assets, as our portfolio combines different financial worlds.
+
+In order to accurately assess the correct model specification, numerous different models were established. 
+Starting from ARMA (0,0) to ARMA (12,12) as a mean-defining factor in GARCH, and orders of GARCH starting from (1,1) to (4,4). 
+However, after careful consideration of available scientific research on the given matter, I've decided to compare only GARCH orders from (1,1) to (2,2) as they should be able to effectively model the volatility, within being overly complicated in their nature.
+
+
+## Model Estimation
+
+
+
+```{r GARCH Comparison, cache = TRUE, echo = FALSE, warning=FALSE}
+run_garch_model <- function(arma_p, arma_q, garch_p, garch_q, solver ='hybrid') {
+  garch_spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(garch_p, garch_q)),
+                           mean.model = list(armaOrder = c(arma_p, arma_q), include.mean = TRUE),
+                           distribution.model = "std")
+  garch_fit <- tryCatch({
+    ugarchfit(spec = garch_spec, data = portfolio_returns_df, solver = solver)
+  }, error = function(e) {
+    message("Error in GARCH fitting: ", e$message)
+    return(NULL)  # Return NULL if there's an error
+  })
+  
+  if (is.null(garch_fit)) {
+    return(NULL)
+  }
+  
+  residuals_garch <- residuals(garch_fit, standardize = TRUE)
+  sigma_garch <- sigma(garch_fit)
+  lb_res <- Box.test(residuals_garch, lag = 5, type = "Ljung-Box")$p.value
+  lb_res_sq <- Box.test(residuals_garch^2, lag = 5, type = "Ljung-Box")$p.value
+  arch_test5 <- ArchTest(residuals_garch, lags = 5)$p.value
+  arch_test10 <- ArchTest(residuals_garch, lags = 10)$p.value
+  acf_res <- sum(abs(acf(residuals_garch, plot = FALSE)$acf[2:12]))
+  acf_res_sq <- sum(abs(acf(residuals_garch^2, plot = FALSE)$acf[2:12]))
+  aic_value <- infocriteria(garch_fit)[1]
+  
+  return(list(arma_p = arma_p, arma_q = arma_q, garch_p = garch_p, garch_q = garch_q,
+              Ljung_Box_Res = lb_res,
+              Ljung_Box_SqRes = lb_res_sq,
+              LM_ARCH_Test5 = arch_test5,
+              LM_ARCH_Test10 = arch_test10,
+              Conditional_SD = mean(sigma_garch),
+              ACF_Res = acf_res,
+              ACF_SqRes = acf_res_sq,
+              AIC = aic_value))
+}
+
+
+results_list <- list()
+for (arma_p in 1:12) {
+  for (arma_q in 1:12) {
+    for (garch_p in 1:1) {
+      for (garch_q in 1:1) {
+        result <- tryCatch({
+          run_garch_model(arma_p, arma_q, garch_p, garch_q)
+        }, error = function(e) {
+          message("Error in iteration (", arma_p, ", ", arma_q, ", ", garch_p, ", ", garch_q, "): ", e$message)
+          return(NULL)
+        })
+        if (!is.null(result)) {
+          results_list[[length(results_list) + 1]] <- result
+        }
+        #print(list(arma_p, arma_q, garch_p, garch_q))
+      }
+    }
+  }
+}
+
+
+
+
+```
+
+``` {r}
+results_df <- do.call(rbind, lapply(results_list, as.data.frame))
+filtered_results_df <- results_df %>%
+  select(-ACF_Res, -ACF_SqRes) %>% 
+  filter(Ljung_Box_Res > 0.04, Ljung_Box_SqRes > 0.04) %>% 
+  arrange(desc(LM_ARCH_Test5)) %>% 
+  slice_head(n = 10) 
+
+filtered_results_df %>%
+  kable("html", caption = "Filtered GARCH Models (Ljung-Box and LM ARCH Test p-values > 0.05) Sorted by AIC") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = F)
+```
+
+As can be seen on the basis of the preliminary analysis of the models, for further analysis I will perform ARMA(11,12)-GARCH(1,1) model
+
+
+
+``` {r ACF & PACF of residuals}
+garch_spec_1 <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+                           mean.model = list(armaOrder = c(11, 12), include.mean = TRUE),
+                           distribution.model = "std")
+garch_fit_1 <- ugarchfit(spec = garch_spec_1, data = portfolio_returns_df)
+residuals_1 <- residuals(garch_fit_1, standardize = TRUE)
+squared_residuals_1 <- residuals_1^2
+
+par(mfrow = c(2, 2)) 
+
+acf(residuals_1, main = "ARMA(11,12) GARCH(1,1) - ACF Residuals", lag.max = 20)
+acf(squared_residuals_1, main = "ARMA(11,12) GARCH(1,1) - ACF Squared Residuals", lag.max = 20)
+pacf(residuals_1, main = "ARMA(11,12) GARCH(1,1) - PACF Residuals", lag.max = 20)
+pacf(squared_residuals_1, main = "ARMA(11,12) GARCH(1,1) - PACF Squared Residuals", lag.max = 20)
+```
+
+
+As can be seen, ACF & PACF still a possibility of left autocorrelation among the residuals, however according to Ljung-Box test, the residuals are independently distributed.
+
+Detailed results of the GARCH model looks as following:
+What can be seen is 
+``` {r, echo=FALSE}
+garch_fit_1
+```
+
+Based on the given results, the employed model exhibits no autocorrelation among the residuals based on the basis of Ljung-Box test results, and no ARCH characteristics left according to weighted *ARCH-LM* test. (as p-values were higher than assumed 0.05 significance level)
+
+## GARCH & EGARCH comparison
+
+### Parameters inteprertation
+
+``` {r, eval = False}
+garch_spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+                           mean.model = list(armaOrder = c(1, 1), include.mean = TRUE),
+                           distribution.model = "std")
+garch_fit <- ugarchfit(spec = garch_spec, data = portfolio_returns_df)
+
+egarch_spec <- ugarchspec(variance.model = list(model = "eGARCH", garchOrder = c(1, 1)),
+                           mean.model = list(armaOrder = c(1, 1), include.mean = TRUE),
+                           distribution.model = "std")
+egarch_fit <- ugarchfit(spec = egarch_spec, data = portfolio_returns_df)
+
+```
+
+
+``` {r, echo = FALSE, eval = TRUE}
+
+comparison_df <- data.frame(
+  Parameter = c('mu', 'ar1', 'ar2', 'ar3', 'ar4', 'ar5', 'ar6', 'ar7', 'ar8', 'ar9', 'ar10', 'ar11',
+                'ma1', 'ma2', 'ma3', 'ma4', 'ma5', 'ma6', 'ma7', 'ma8', 'ma9', 'ma10', 'ma11', 'ma12',
+                'omega', 'alpha1', 'beta1', 'gamma1', 'shape'),
+  GARCH_Estimate = c(0.001070, -0.234099, -0.291947, -0.076605, -0.294852, 0.220055, -0.189896, 
+                     0.243992, 0.028780, -0.025350, -0.749395, 0.111023, 0.221641, 0.335353, 
+                     0.066063, 0.257082, -0.267727, 0.221864, -0.282354, 0.018578, 0.054568, 
+                     0.826884, -0.077334, 0.108817, 0.000003, 0.045476, 0.941223, "-", 3.745358),
+  GARCH_Pr = c(0.000045, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 
+               0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 
+               0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 
+               0.000000, 0.000000, 0.000000, 0.353840, 0.004908, 0.000000, "-", 0.000000),
+  EGARCH_Estimate = c(0.000986, 0.049637, -0.310202, 0.308416, -0.396631, 0.490990, -0.463930, 
+                      0.263596, -0.059174, -0.106336, -0.599438, 0.145343, -0.082137, 0.397319, 
+                      -0.323442, 0.401387, -0.545752, 0.538121, -0.339334, 0.112619, 0.093098, 
+                      0.659524, -0.148167, 0.123726, -0.126006, -0.014848, 0.985210, 0.099959, 3.679854),
+  EGARCH_Pr = c(0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 
+                0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 
+                0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 0.00000, 
+                0.00000, 0.25322, 0.00000, 0.00023, 0.00000)
+)
+
+nyblom_df <- data.frame(
+  Parameter = c('mu', 'ar1', 'ar2', 'ar3', 'ar4', 'ar5', 'ar6', 'ar7', 'ar8', 'ar9', 'ar10', 'ar11',
+                'ma1', 'ma2', 'ma3', 'ma4', 'ma5', 'ma6', 'ma7', 'ma8', 'ma9', 'ma10', 'ma11', 'ma12',
+                'omega', 'alpha1', 'beta1', 'shape'),
+  GARCH = c(0.188729, 0.009644, 0.021881, 0.060705, 0.040124, 0.029027, 0.027414, 0.009470,
+            0.015564, 0.026207, 0.042444, 0.030423, 0.035627, 0.016352, 0.069853, 0.018669,
+            0.022773, 0.042197, 0.017513, 0.022123, 0.022254, 0.011563, 0.027000, 0.042983,
+            1.083351, 0.459599, 0.466493, 0.660119),
+  EGARCH = c(0.017881, 0.010208, 0.020270, 0.007628, 0.023122, 0.007936, 0.022901, 0.008508,
+             0.022563, 0.007186, 0.023834, 0.007914, 0.024218, 0.007271, 0.023988, 0.007500,
+             0.023525, 0.007414, 0.023551, 0.007212, 0.023941, 0.009411, 0.022959, 0.007939,
+             0.252480, 0.360863, 0.257954, 0.469246)
+)
+
+# Sign Bias Test (GARCH and EGARCH)
+sign_bias_df <- data.frame(
+  Test = c('Sign Bias', 'Negative Sign Bias', 'Positive Sign Bias', 'Joint Effect'),
+  GARCH_t_value = c(0.3242, 2.4584, 0.3976, 6.7986),
+  GARCH_prob = c(0.74581, 0.01405, 0.69098, 0.07860),
+  GARCH_sig = c('', '**', '', '*'),
+  EGARCH_t_value = c(0.3958, 2.1980, 0.9368, 7.0246),
+  EGARCH_prob = c(0.69231, 0.02807, 0.34900, 0.07112),
+  EGARCH_sig = c('', '**', '', '*')
+)
+
+# Adjusted Pearson Goodness-of-Fit Test (GARCH and EGARCH)
+pearson_df <- data.frame(
+  Group = c(20, 30, 40, 50),
+  GARCH_Statistic = c(30.09, 34.42, 51.89, 68.01),
+  GARCH_p_value = c(0.05066, 0.22406, 0.08113, 0.03736),
+  EGARCH_Statistic = c(35.04, 39.65, 49.70, 64.62),
+  EGARCH_p_value = c(0.01380, 0.08979, 0.11717, 0.06664)
+)
+
+```
+
+#### Parameter Comparison (GARCH vs EGARCH)
+
+``` {r, echo = FALSE}
+kable(comparison_df, format = "html", caption = "Nyblom Stability Test (GARCH vs EGARCH)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+Basing on the comparison above, both models exhibits different ARMA processes (with different estimates), however in both cases all of the augmentations are significant, which confirms preliminary assumptions based on ACF & PACF graphs. Further for GARCH model both parameters alpha & beta are significant, and their sum is below 1, which indicates that the model is stationary and both past returns and past volatility are significant in forecasting future volatility
+
+However, looking at EGARCH model, alpha parameter is insignificant, which could lead to changing the specification of the model. Nonetheless, parameter gamma of eGARCH equation is significant and positive, which indicates singnificance of leverage effect, that negative returns create higher volatility than postiive returns.
+
+
+#### Nyblom Stability Test
+``` {r, echo = FALSE}
+kable(nyblom_df, format = "html", caption = "Nyblom Stability Test (GARCH vs EGARCH)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+Overall, ARMA process parameters are stable as they don't exceed the critical value (0.47), however EGARCH should be classified as more stable, as some of the estimations differs (shape, omega).
+
+
+#### Sign Bias 
+``` {r, echo = FALSE}
+kable(sign_bias_df, format = "html", caption = "Sign Bias Test (GARCH vs EGARCH)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+```
+Based on the table above, both models shows assymetry and are biased towards negative sign's returns. However EGARCH should perform slightly better, given that it is designed to capture parts of the volatility assymetry.
+
+
+#### Adjusted Pearson Goodness-of-Fit
+``` {r, echo = FALSE}
+kable(pearson_df, format = "html", caption = "Adjusted Pearson Goodness-of-Fit Test (GARCH vs EGARCH)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+Based on the given Pearson Goodness-of-Fit test comparison, both models are mostly fitting to the given (t-student) distribution (as p-values is higher than assumed significance level of 0.05)
+
+### News impact curve
+
+``` {r, echo = TRUE}
+news_impact_garch <- newsimpact(garch_fit)
+garch_impact_df <- data.frame(Shock = news_impact_garch$zx, Impact = news_impact_garch$zy, Model = "GARCH(1,1)")
+news_impact_egarch <- newsimpact(egarch_fit)
+egarch_impact_df <- data.frame(Shock = news_impact_egarch$zx, Impact = news_impact_egarch$zy, Model = "EGARCH(1,1)")
+
+news_impact_df <- rbind(garch_impact_df, egarch_impact_df)
+ggplot(news_impact_df, aes(x = Shock, y = Impact, color = Model)) +
+  geom_line(size = 1.2) +
+  labs(title = "News Impact Curve for GARCH(1,1) and EGARCH(1,1)",
+       x = "Shocks",
+       y = "Volatility Impact") +
+  theme_minimal(base_size = 15) +
+  scale_color_manual(values = c("GARCH(1,1)" = "blue", "EGARCH(1,1)" = "red")) +
+  theme(legend.position = "top", 
+        plot.title = element_text(hjust = 0.5))
+
+```
+Looking at News Impact representation, it can be seen that EGARCH exhibits assymetry in impacts, based on the returns' sign unlike GARCH model.
+
+## Forecast
+
+In order to accurately compare the forecast given period is divided into in-sample and out-of-sample period:
+
+``` {r, echo = TRUE, eval = TRUE}
+start_in_sample <- as.Date("2019-01-01")
+end_in_sample <- as.Date("2022-12-31")
+start_out_sample <- as.Date("2023-01-01")
+end_out_sample <- start_out_sample + 364  
+
+in_sample_data <- returns_combined$Portfolio[index(returns_combined$Portfolio) >= start_in_sample & 
+                                               index(returns_combined$Portfolio) <= end_in_sample]
+
+out_of_sample_data <- returns_combined$Portfolio[index(returns_combined$Portfolio) >= start_out_sample & 
+                                                   index(returns_combined$Portfolio) <= end_out_sample]
+```
+
+``` {r, echo = FALSE, eval = TRUE, cache = TRUE}
+calculate_rolling_var <- function(model_spec, in_sample_data, out_of_sample_data, alpha = 0.05, solver = "hybrid") {
+  n_out <- nrow(out_of_sample_data)
+  window_size <- nrow(in_sample_data)
+  VaR_values <- numeric(n_out)
+  
+  combined_data <- rbind(in_sample_data, out_of_sample_data)
+  
+  standardized_returns <- (combined_data - mean(combined_data, na.rm = TRUE)) / sd(combined_data, na.rm = TRUE)
+  q01 <- quantile(standardized_returns, probs = alpha, na.rm = TRUE)
+  
+  for (i in 1:n_out) {
+    current_window_data <- combined_data[i:(window_size + i - 1), ]
+    
+    fit <- tryCatch(
+      ugarchfit(spec = model_spec, data = current_window_data, solver = solver),
+      error = function(e) {
+        message("Error in GARCH fitting at iteration ", i, ": ", e$message)
+        return(NULL) 
+      }
+    )
+    
+    if (!is.null(fit)) {
+      forecast <- ugarchforecast(fit, n.ahead = 1)
+      sigma_forecast <- forecast@forecast$sigmaFor[1, 1]
+      mu_forecast <- forecast@forecast$seriesFor[1, 1]
+      VaR_values[i] <- mu_forecast + sigma_forecast * qnorm(alpha)
+    } else {
+      VaR_values[i] <- NA
+    }
+    print(n_out)
+  }
+  
+  return(VaR_values)
+}
+```
+
+``` {r, echo = TRUE, cache = TRUE, warning = FALSE}
+VaR_garch <- calculate_rolling_var(garch_spec, in_sample_data, out_of_sample_data)
+VaR_egarch <- calculate_rolling_var(egarch_spec, in_sample_data, out_of_sample_data)
+actual_returns <- coredata(out_of_sample_data)
+```
+
+
+``` {r, echo = FALSE}
+garch_violations <- sum(actual_returns < VaR_garch) / length(VaR_garch)
+egarch_violations <- sum(actual_returns < VaR_egarch) / length(VaR_egarch)
+var_comparison <- data.frame(
+  Model = c("GARCH(1,1)", "EGARCH(1,1)"),
+  VaR_Violations = c(garch_violations, egarch_violations)
+)
+
+alpha <- 0.05
+```
+
+
+### Backtesting tests
+``` {r, echo = TRUE, eval = TRUE}
+# 1. Kupiec’s Proportion of Failures (POF) Test
+kupiec_test <- function(actual_returns, VaR_values, alpha) {
+  n <- length(VaR_values)
+  failures <- sum(actual_returns < VaR_values)
+  pof_stat <- -2 * log(((1 - failures / n)^(n - failures)) * (failures / n)^failures) +
+    2 * log(((1 - alpha)^(n - failures)) * alpha^failures)
+  p_value <- 1 - pchisq(pof_stat, 1)
+  return(p_value)
+}
+
+# 2. Christoffersen Independence test
+christoffersen_independence_test <- function(actual_returns, VaR_values) {
+  hit <- ifelse(actual_returns < VaR_values, 1, 0)
+  T00 <- sum(hit[-length(hit)] == 0 & hit[-1] == 0)
+  T01 <- sum(hit[-length(hit)] == 0 & hit[-1] == 1)
+  T10 <- sum(hit[-length(hit)] == 1 & hit[-1] == 0)
+  T11 <- sum(hit[-length(hit)] == 1 & hit[-1] == 1)
+  
+  p01 <- T01 / (T00 + T01)
+  p11 <- T11 / (T10 + T11)
+  
+  LR_indep <- -2 * log(((1 - p01)^(T00) * p01^T01) * ((1 - p11)^(T10) * p11^T11))
+  p_value <- 1 - pchisq(LR_indep, 1)
+  return(p_value)
+}
+
+# 3. Christoffersen Conditional Coverage Test
+christoffersen_conditional_coverage_test <- function(actual_returns, VaR_values, alpha) {
+  pof_test <- kupiec_test(actual_returns, VaR_values, alpha)
+  indep_test <- christoffersen_independence_test(actual_returns, VaR_values)
+  LR_cc <- pof_test + indep_test
+  p_value <- 1 - pchisq(LR_cc, 2)
+  return(p_value)
+}
+
+# 4. BASEL lights' test
+lights_test <- function(violations, n, alpha) {
+  expected_violations <- n * alpha
+  if (violations < expected_violations + 1.96 * sqrt(expected_violations)) {
+    return("Green")
+  } else if (violations < expected_violations + 2.58 * sqrt(expected_violations)) {
+    return("Yellow")
+  } else {
+    return("Red")
+  }
+}
+```
+
+``` {r, echo = FALSE, eval = TRUE}
+garch_kupiec <- kupiec_test(actual_returns, VaR_garch, alpha)
+egarch_kupiec <- kupiec_test(actual_returns, VaR_egarch, alpha)
+garch_independence <- christoffersen_independence_test(actual_returns, VaR_garch)
+egarch_independence <- christoffersen_independence_test(actual_returns, VaR_egarch)
+garch_conditional_coverage <- christoffersen_conditional_coverage_test(actual_returns, VaR_garch, alpha)
+egarch_conditional_coverage <- christoffersen_conditional_coverage_test(actual_returns, VaR_egarch, alpha)
+garch_lights <- lights_test(sum(actual_returns < VaR_garch), length(VaR_garch), alpha)
+egarch_lights <- lights_test(sum(actual_returns < VaR_egarch), length(VaR_egarch), alpha)
+
+var_comparison_with_tests <- data.frame(
+  Model = c("GARCH(2,4)", "EGARCH(2,4)"),
+  VaR_Violations = c(garch_violations, egarch_violations),
+  Lights_Test = c(garch_lights, egarch_lights),
+  Kupiec_Test_PValue = c(garch_kupiec, egarch_kupiec),
+  Christoffersen_I_PValue = c(garch_independence, egarch_independence),
+  Christoffersen_II_PValue = c(garch_conditional_coverage, egarch_conditional_coverage)
+)
+var_comparison_with_tests %>%
+  kable("html", caption = "VaR Violations and Statistical Test Results: GARCH(1,1) vs. EGARCH(1,1)", align = 'c') %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = FALSE)
+```
+
+
+#### Backtesging
+``` {r}
+plot_var_with_two_models <- function(actual_returns, VaR_garch, VaR_egarch, title) {
+  
+  # Extract core data from the xts object for plotting
+  data_plot <- data.frame(
+    Date = index(actual_returns),
+    Returns = as.numeric(coredata(actual_returns)),
+    VaR_garch = VaR_garch,
+    VaR_egarch = VaR_egarch
+  )
+  
+  # Identify violation points for both GARCH and EGARCH where returns are below VaR
+  violation_points_garch <- data_plot$Returns < data_plot$VaR_garch
+  violation_points_egarch <- data_plot$Returns < data_plot$VaR_egarch
+  
+  # Plot the returns, VaR lines for both models, and violation points
+  ggplot(data_plot, aes(x = Date)) +
+    geom_line(aes(y = Returns, color = "Returns"), size = 1) +
+    geom_line(aes(y = VaR_garch, color = "VaR (GARCH)"), linetype = "solid", size = 1) +
+    geom_line(aes(y = VaR_egarch, color = "VaR (EGARCH)"), linetype = "solid", size = 1) + 
+    geom_point(data = data_plot[violation_points_garch, ], aes(y = Returns, color = "Violations (GARCH)"), shape = 19, size = 4, alpha = 0.5) + 
+    geom_point(data = data_plot[violation_points_egarch, ], aes(y = Returns, color = "Violations (EGARCH)"), shape = 19, size = 4, alpha = 0.5) + 
+    labs(title = title, x = "Date", y = "Log returns") +
+    theme_minimal() +
+    
+    scale_color_manual(values = c("Returns" = "black", 
+                                  "VaR (GARCH)" = "#FF9999",
+                                  "VaR (EGARCH)" = "#99CCFF",
+                                  "Violations (GARCH)" = "#FF0000",
+                                  "Violations (EGARCH)" = "#0000FF"
+    )) +
+    
+    # Customize legend position and background
+    theme(legend.position = c(0.85, 0.15),
+          legend.background = element_rect(fill = "gray90", color = "gray70", size = 0.5),
+          legend.title = element_blank())
+}
+
+
+plot_var_with_two_models(out_of_sample_data, VaR_garch, VaR_egarch, "GARCH(1,1) and EGARCH(1,1) Out-of-Sample")
+```
+
